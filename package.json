@@ -1,5 +1,5 @@
 {
-  "name": "github-monitor",
+  "name": "Github-monitor",
   "version": "1.0.0",
   "main": "scanner.js",
   "type": "commonjs",
