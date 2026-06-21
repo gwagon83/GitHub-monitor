@@ -12,35 +12,30 @@ const ALERT_THRESHOLD = 25;
 const HIGH_CONFIDENCE_THRESHOLD = 35;
 
 const MAX_FILE_SIZE = 800000;
-const BASE_SLEEP = 5000;
+const BASE_SLEEP = 3500;
 
-const ALERT_COOLDOWN = 6 * 60 * 60 * 1000; // 6 hours
+const ALERT_COOLDOWN = 6 * 60 * 60 * 1000;
+const REPO_MEMORY_TTL = 45 * 60 * 1000; // 🔥 prevents repeats for 45 min
 
 // =========================
-// STATE CACHE
+// STATE
 // =========================
 
-const processedUrls = new Set();
+const processedFiles = new Set();
 const repoCache = new Map();
-const alertedRepos = new Map(); // 🔥 FIX: prevents repeat alerts across cycles
-
-// =========================
-// WEIGHTS
-// =========================
-
-const WEIGHTS = {
-  low: 1,
-  medium: 3,
-  high: 7,
-  critical: 15,
-};
+const alertedRepos = new Map();
+const repoSeenAt = new Map();
 
 // =========================
 // HELPERS
 // =========================
 
-function buildRepoUrl(repoName) {
-  return `https://github.com/${repoName}`;
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function buildRepoUrl(repo) {
+  return `https://github.com/${repo}`;
 }
 
 function getRiskBadge(score) {
@@ -51,173 +46,133 @@ function getRiskBadge(score) {
 }
 
 // =========================
-// KEYWORDS
+// KEYWORDS BASE
 // =========================
 
-const KEYWORDS = [...new Set([
+const BASE_KEYWORDS = [
   "wallet drainer",
   "crypto drainer",
-  "wallet connect phishing",
-  "wallet connect scam",
   "seed phrase",
   "recovery phrase",
-  "mnemonic phrase",
-  "import wallet",
-  "restore wallet",
-  "connect wallet",
-  "wallet verification",
-  "claim airdrop",
-  "claim rewards",
-  "free mint",
   "walletconnect",
   "wagmi",
-  "ethers.js",
-  "setapprovalforall",
+  "setApprovalForAll",
   "permit2",
   "personal_sign"
-])];
+];
+
+// =========================
+// QUERY MUTATION ENGINE (🔥 FIX #1)
+// =========================
+
+function buildQueries() {
+  const modifiers = [
+    "",
+    "language:javascript",
+    "language:typescript",
+    "extension:js",
+    "extension:ts",
+    "wallet connect",
+    "airdrop claim",
+    "mint nft"
+  ];
+
+  const queries = [];
+
+  for (const k of BASE_KEYWORDS) {
+    for (const m of modifiers) {
+      queries.push(`${k} ${m}`.trim());
+    }
+  }
+
+  return queries;
+}
 
 // =========================
 // PATTERNS
 // =========================
 
 const SECRET_PATTERNS = [
-  { name: "Seed Phrase", regex: /(seed phrase|recovery phrase|mnemonic)/gi, severity: "critical" },
-  { name: "Wallet Input Theft", regex: /(enter|input|paste).{0,40}(seed|phrase)/gi, severity: "critical" },
-  { name: "Approval Abuse", regex: /setApprovalForAll|increaseAllowance/gi, severity: "high" },
-  { name: "Signature Abuse", regex: /eth_signTypedData|personal_sign/gi, severity: "medium" },
-  { name: "Drain Logic", regex: /(drain wallet|sweep wallet|transfer all balance)/gi, severity: "critical" },
-  { name: "Webhook Exfiltration", regex: /discord|telegram\.org\/bot|webhook/i, severity: "critical" }
+  { regex: /(seed phrase|recovery phrase|mnemonic)/gi, weight: 10 },
+  { regex: /(enter|input|paste).{0,40}(seed|phrase)/gi, weight: 12 },
+  { regex: /setApprovalForAll|increaseAllowance/gi, weight: 8 },
+  { regex: /eth_signTypedData|personal_sign/gi, weight: 6 },
+  { regex: /(drain wallet|sweep wallet|transfer all balance)/gi, weight: 15 },
+  { regex: /discord|telegram\.org\/bot|webhook/i, weight: 10 }
 ];
-
-// =========================
-// BEHAVIOR PATTERNS
-// =========================
 
 const BEHAVIOR_PATTERNS = [
-  { regex: /(approve|setApprovalForAll).{0,80}(transfer|drain|sweep)/gi, weight: 12 },
-  { regex: /(sign|signature).{0,80}(claim|verify|reward|airdrop)/gi, weight: 10 },
-  { regex: /(connect wallet).{0,50}(claim|mint|verify)/gi, weight: 9 },
-  { regex: /(transferFrom|send max|drain wallet)/gi, weight: 15 }
+  { regex: /(approve|setApprovalForAll).{0,80}(drain|transfer)/gi, weight: 12 },
+  { regex: /(sign|signature).{0,60}(claim|airdrop|mint)/gi, weight: 10 },
+  { regex: /(connect wallet).{0,40}(claim|verify|mint)/gi, weight: 9 }
 ];
-
-// =========================
-// LEGIT FILTER
-// =========================
-
-const LEGIT_CONTEXT = [
-  /next\.js|react|vite|nuxt/i,
-  /hardhat|foundry|ethers\.js|wagmi/i,
-  /openzeppelin|uniswap|aave/i,
-  /tutorial|example|template|docs/i
-];
-
-// =========================
-// NOISE FILTER
-// =========================
-
-function shouldSkipFile(item) {
-  const path = (item.path || "").toLowerCase();
-
-  return (
-    path.endsWith(".md") ||
-    path.includes("readme") ||
-    path.includes("license") ||
-    path.includes("/docs/") ||
-    path.includes("/example/") ||
-    path.includes(".map") ||
-    path.includes("package-lock.json")
-  );
-}
 
 // =========================
 // SIGNAL ENGINE
 // =========================
 
 function extractSignals(content) {
-  let signalScore = 0;
-  let behaviorScore = 0;
-  let legitPenalty = 0;
+  let score = 0;
+  let behavior = 0;
 
   for (const p of SECRET_PATTERNS) {
-    if (p.regex.test(content)) signalScore += WEIGHTS[p.severity] || 0;
+    if (p.regex.test(content)) score += p.weight;
   }
 
   for (const b of BEHAVIOR_PATTERNS) {
-    if (b.regex.test(content)) behaviorScore += b.weight;
+    if (b.regex.test(content)) behavior += b.weight;
   }
 
-  for (const l of LEGIT_CONTEXT) {
-    if (l.test(content)) legitPenalty += 8;
-  }
-
-  return { signalScore, behaviorScore, legitPenalty };
+  return {
+    signalScore: score,
+    behaviorScore: behavior,
+    legitPenalty: 0
+  };
 }
 
 // =========================
-// REPO AGGREGATOR
+// REPO STORAGE
 // =========================
 
-function updateRepo(repoName, data) {
-  if (!repoCache.has(repoName)) {
-    repoCache.set(repoName, {
+function updateRepo(repo, data) {
+  if (!repoCache.has(repo)) {
+    repoCache.set(repo, {
       signalScore: 0,
       behaviorScore: 0,
-      legitPenalty: 0,
       files: 0
     });
   }
 
-  const repo = repoCache.get(repoName);
-
-  repo.signalScore += data.signalScore;
-  repo.behaviorScore += data.behaviorScore;
-  repo.legitPenalty += data.legitPenalty;
-  repo.files += 1;
-
-  repoCache.set(repoName, repo);
+  const r = repoCache.get(repo);
+  r.signalScore += data.signalScore;
+  r.behaviorScore += data.behaviorScore;
+  r.files += 1;
 }
 
 // =========================
-// SCORE MODEL
+// GITHUB SEARCH (FIXED)
 // =========================
 
-function computeRepoScore(repo) {
-  let score =
-    repo.signalScore +
-    repo.behaviorScore * 1.5 -
-    repo.legitPenalty;
-
-  if (repo.behaviorScore > 20 && repo.signalScore > 10) {
-    score += 10;
-  }
-
-  return score;
-}
-
-// =========================
-// GITHUB SEARCH
-// =========================
-
-async function searchKeyword(keyword) {
-  const url = `https://api.github.com/search/code?q=${encodeURIComponent(keyword)}+in:file&per_page=30&sort=indexed`;
-
+async function searchGitHub(query) {
   try {
+    const url =
+      `https://api.github.com/search/code?q=${encodeURIComponent(query)}&per_page=30`;
+
     const res = await axios.get(url, {
       headers: {
         Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-        "User-Agent": "org-scanner"
+        "User-Agent": "soc-scanner"
       }
     });
 
     return res.data?.items || [];
-  } catch {
+  } catch (e) {
     return [];
   }
 }
 
 // =========================
-// FETCH FILE
+// FILE FETCH
 // =========================
 
 async function fetchFile(item) {
@@ -240,94 +195,72 @@ async function fetchFile(item) {
 // PROCESS
 // =========================
 
-async function processKeyword(keyword) {
-  const results = await searchKeyword(keyword);
+async function processQuery(query) {
+  const results = await searchGitHub(query);
 
   for (const item of results) {
-    try {
-      const repoName = item.repository.full_name;
-      const hash = `${repoName}:${item.path}`;
+    const repo = item.repository.full_name;
+    const fileKey = `${repo}:${item.path}`;
 
-      if (processedUrls.has(hash)) continue;
-      if (shouldSkipFile(item)) continue;
+    if (processedFiles.has(fileKey)) continue;
 
-      const content = await fetchFile(item);
-      if (!content) continue;
+    // 🔥 repo cooldown filter
+    const lastSeen = repoSeenAt.get(repo);
+    if (lastSeen && Date.now() - lastSeen < REPO_MEMORY_TTL) continue;
 
-      const signals = extractSignals(content);
+    const content = await fetchFile(item);
+    if (!content) continue;
 
-      updateRepo(repoName, signals);
+    const signals = extractSignals(content);
 
-      processedUrls.add(hash);
-
-    } catch (err) {
-      console.error("Process error:", err.message);
-    }
+    updateRepo(repo, signals);
+    processedFiles.add(fileKey);
+    repoSeenAt.set(repo, Date.now());
   }
 }
 
 // =========================
-// SOC ALERT ENGINE (FIXED + NO REPEATS)
+// EVALUATION
 // =========================
 
-async function evaluateRepos() {
-  const now = Date.now();
+async function evaluate() {
+  for (const [repo, data] of repoCache.entries()) {
 
-  for (const [repoName, repo] of repoCache.entries()) {
-
-    const score = computeRepoScore(repo);
+    const score = data.signalScore + data.behaviorScore * 1.5;
     const risk = getRiskBadge(score);
-    const repoUrl = buildRepoUrl(repoName);
+    const url = buildRepoUrl(repo);
 
-    // 🔥 COOLDOWN CHECK (FIX REPEATS)
-    if (alertedRepos.has(repoName)) {
-      const last = alertedRepos.get(repoName);
-      if (now - last < ALERT_COOLDOWN) {
-        console.log("⏳ Skipping repeat alert:", repoName);
-        continue;
-      }
+    if (score < ALERT_THRESHOLD) continue;
+
+    if (alertedRepos.has(repo)) {
+      if (Date.now() - alertedRepos.get(repo) < ALERT_COOLDOWN) continue;
     }
+
+    alertedRepos.set(repo, Date.now());
 
     await pool.query(
       `INSERT INTO findings (keyword, repo_name, file_path, html_url, score, severity)
        VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT DO NOTHING`,
-      ["repo-analysis", repoName, null, null, score, risk]
+      ["repo-analysis", repo, null, url, score, risk]
     );
 
-    if (score >= ALERT_THRESHOLD) {
-
-      alertedRepos.set(repoName, now); // 🔥 LOCK ALERT
-
-      await sendTelegram(
-`🚨 SOC POLLING INTELLIGENCE CARD
-
+    await sendTelegram(
+`🚨 SOC INTELLIGENCE CARD
 ━━━━━━━━━━━━━━━━━━
 ${risk}
-━━━━━━━━━━━━━━━━━━
 
-📦 Repository
-${repoName}
+Repo: ${repo}
+${url}
 
-🔗 GitHub Link
-${repoUrl}
-
-📊 Risk Score: ${score.toFixed(2)}
-
-📁 Files Analyzed: ${repo.files}
-
-🧬 Signal Score: ${repo.signalScore}
-⚙️ Behavior Score: ${repo.behaviorScore}
-⚠️ Legit Penalty: ${repo.legitPenalty}
-
-━━━━━━━━━━━━━━━━━━
-Confidence: ${score >= HIGH_CONFIDENCE_THRESHOLD ? "HIGH" : "MEDIUM"}
-Scan Type: Polling Scanner (GitHub Search API)
+Score: ${score.toFixed(2)}
+Files: ${data.files}
+Signal: ${data.signalScore}
+Behavior: ${data.behaviorScore}
 ━━━━━━━━━━━━━━━━━━`
-      );
+    );
 
-      console.log("🚨 ALERT:", repoName);
-    }
+    console.log("🚨 ALERT:", repo);
   }
 }
 
@@ -338,15 +271,23 @@ Scan Type: Polling Scanner (GitHub Search API)
 async function runCycle() {
   console.log("🔄 Scan cycle started");
 
-  processedUrls.clear();
+  const queries = buildQueries();
+
+  processedFiles.clear();
   repoCache.clear();
 
-  for (const keyword of KEYWORDS) {
-    await processKeyword(keyword);
-    await new Promise(r => setTimeout(r, BASE_SLEEP));
+  // 🔥 shuffle queries every cycle
+  for (let i = queries.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [queries[i], queries[j]] = [queries[j], queries[i]];
   }
 
-  await evaluateRepos();
+  for (const q of queries) {
+    await processQuery(q);
+    await sleep(2500 + Math.random() * 1500);
+  }
+
+  await evaluate();
 
   console.log("✅ Cycle complete");
 }
@@ -355,18 +296,18 @@ async function runCycle() {
 // WORKER
 // =========================
 
-async function startWorker() {
+async function start() {
   console.log("🚀 SOC Polling Scanner started");
 
   while (true) {
     try {
       await runCycle();
-      console.log("💤 sleeping...");
-      await new Promise(r => setTimeout(r, 10 * 60 * 1000));
+      await sleep(8 * 60 * 1000);
     } catch (e) {
       console.error("Worker crash:", e.message);
+      await sleep(5000);
     }
   }
 }
 
-startWorker();
+start();
